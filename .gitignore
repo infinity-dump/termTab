@@ -1,0 +1,27 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local secrets and runtime state
+.env
+.env.*
+objective.md
+*.key
+*.pem
+*.p12
+*.mobileprovision
+secrets.*
+ai.toml
+config/ai.toml
+
+# Logs and generated caches
+*.log
+.cache/
+cache/
+dist/
+build/

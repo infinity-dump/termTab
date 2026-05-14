@@ -1,0 +1,21 @@
+[inline]
+enabled = true
+accept_keys = ["right", "tab"]
+debounce_ms = 120
+
+[history]
+enabled = true
+direct_match_min_chars = 3
+max_entries = 8000
+max_bytes = 2097152
+top_matches = 8
+max_suggestion_chars = 320
+recency_weight = 100
+frequency_weight = 8
+
+[provider]
+name = "openrouter"
+model = "mistralai/codestral-2508"
+base_url = "https://openrouter.ai/api/v1"
+sort = "latency"
+max_tokens = 24
