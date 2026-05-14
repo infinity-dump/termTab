@@ -19,8 +19,11 @@ except Exception:  # pragma: no cover
     tomllib = None
 
 
-CONFIG_PATH = pathlib.Path.home() / ".config" / "cmux" / "ai.toml"
-CACHE_DIR = pathlib.Path.home() / ".cache" / "cmux" / "inline-ai"
+CONFIG_PATH = pathlib.Path(os.environ.get("TERMTAB_AI_CONFIG", pathlib.Path.home() / ".config" / "termtab" / "ai.toml"))
+LEGACY_CONFIG_PATH = pathlib.Path.home() / ".config" / "cmux" / "ai.toml"
+CACHE_DIR = pathlib.Path.home() / ".cache" / "termtab" / "inline-ai"
+KEYCHAIN_PREFIX = "termtab-ai-"
+LEGACY_KEYCHAIN_PREFIX = "cmux-inline-ai-"
 DEFAULT_MODELS = {
     "anthropic": "claude-3-5-haiku-latest",
     "openai": "gpt-4o-mini",
@@ -62,9 +65,10 @@ def load_config():
             "max_tokens": 24,
         },
     }
-    if CONFIG_PATH.exists() and tomllib is not None:
+    config_path = CONFIG_PATH if CONFIG_PATH.exists() else LEGACY_CONFIG_PATH
+    if config_path.exists() and tomllib is not None:
         try:
-            parsed = tomllib.loads(CONFIG_PATH.read_text())
+            parsed = tomllib.loads(config_path.read_text())
             for section in ("inline", "history", "provider"):
                 if isinstance(parsed.get(section), dict):
                     config.setdefault(section, {}).update(parsed[section])
@@ -99,11 +103,23 @@ def keychain_password(service):
 def provider_key(provider):
     provider = provider.lower()
     if provider == "anthropic":
-        return keychain_password("cmux-inline-ai-anthropic") or os.environ.get("ANTHROPIC_API_KEY")
+        return (
+            keychain_password(KEYCHAIN_PREFIX + "anthropic")
+            or keychain_password(LEGACY_KEYCHAIN_PREFIX + "anthropic")
+            or os.environ.get("ANTHROPIC_API_KEY")
+        )
     if provider == "openai":
-        return keychain_password("cmux-inline-ai-openai") or os.environ.get("OPENAI_API_KEY")
+        return (
+            keychain_password(KEYCHAIN_PREFIX + "openai")
+            or keychain_password(LEGACY_KEYCHAIN_PREFIX + "openai")
+            or os.environ.get("OPENAI_API_KEY")
+        )
     if provider == "openrouter":
-        return keychain_password("cmux-inline-ai-openrouter") or os.environ.get("OPENROUTER_API_KEY")
+        return (
+            keychain_password(KEYCHAIN_PREFIX + "openrouter")
+            or keychain_password(LEGACY_KEYCHAIN_PREFIX + "openrouter")
+            or os.environ.get("OPENROUTER_API_KEY")
+        )
     return None
 
 
@@ -274,7 +290,7 @@ def build_prompt(line, cwd, history_cfg=None):
     )
     help_text = cached_help(command) if command else ""
     system = (
-        "You are cmux inline autocomplete. Complete the current terminal command line like "
+        "You are terminal inline autocomplete. Complete the current terminal command line like "
         "Warp autocomplete. Return only the suffix that should be inserted at the cursor. "
         "Do not repeat the existing prefix. Do not include explanations, markdown, quotes, "
         "or trailing newline. Prefer highly weighted history matches, then exact flags/subcommands "
@@ -358,8 +374,8 @@ def complete_openrouter(model, key, base_url, system, user, max_tokens=24, provi
         system,
         user,
         {
-            "HTTP-Referer": "https://github.com/manaflow-ai/cmux",
-            "X-OpenRouter-Title": "cmux inline AI",
+            "HTTP-Referer": "https://github.com/infinity-dump/termTab",
+            "X-OpenRouter-Title": "termTab inline AI",
         },
         max_tokens,
         provider_options,

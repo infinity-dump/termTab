@@ -5,7 +5,7 @@ provider="${1:-openrouter}"
 case "$provider" in
   openrouter|anthropic|openai) ;;
   *)
-    print -u2 "Usage: cmux-inline-ai-key [openrouter|anthropic|openai]"
+    print -u2 "Usage: termtab-ai-key [openrouter|anthropic|openai]"
     exit 2
     ;;
 esac
@@ -21,5 +21,5 @@ if [[ -z "$key" ]]; then
   exit 1
 fi
 
-security add-generic-password -a "$USER" -s "cmux-inline-ai-$provider" -w "$key" -U >/dev/null
-print "Stored $provider key in macOS Keychain service cmux-inline-ai-$provider."
+security add-generic-password -a "$USER" -s "termtab-ai-$provider" -w "$key" -U >/dev/null
+print "Stored $provider key in macOS Keychain service termtab-ai-$provider."

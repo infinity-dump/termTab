@@ -1,7 +1,7 @@
 # termTab
 
-Warp-style inline AI autocomplete for zsh, rendered through `zsh-autosuggestions`
-and powered by a BYOK local helper.
+Terminal-agnostic inline AI autocomplete for zsh, rendered through
+`zsh-autosuggestions` and powered by a BYOK local helper.
 
 The plugin is designed for command-line completions:
 
@@ -13,6 +13,10 @@ The plugin is designed for command-line completions:
 - API keys are stored in macOS Keychain or read from environment variables.
 - API keys are never stored in this repository or in `ai.toml`.
 
+It works in any terminal that can run zsh and `zsh-autosuggestions`: Apple
+Terminal, iTerm2, Ghostty, VS Code terminals, and similar PTY-based terminal
+apps. There is no dependency on a terminal-specific renderer.
+
 ## Install
 
 ```zsh
@@ -22,21 +26,21 @@ The plugin is designed for command-line completions:
 Then store an OpenRouter key in macOS Keychain:
 
 ```zsh
-cmux-inline-ai-key
+termtab-ai-key
 ```
 
 Provider-specific key storage is also supported:
 
 ```zsh
-cmux-inline-ai-key openrouter
-cmux-inline-ai-key anthropic
-cmux-inline-ai-key openai
+termtab-ai-key openrouter
+termtab-ai-key anthropic
+termtab-ai-key openai
 ```
 
 Open a new terminal, then test:
 
 ```zsh
-python3 ~/.config/cmux/inline-ai/inline_ai_complete.py --line 'git sta' --cwd "$PWD"
+python3 ~/.config/termtab/inline-ai/inline_ai_complete.py --line 'git sta' --cwd "$PWD"
 ```
 
 Expected output when the command exists in your history:
@@ -50,12 +54,12 @@ git status
 Runtime config lives at:
 
 ```text
-~/.config/cmux/ai.toml
+~/.config/termtab/ai.toml
 ```
 
 The public example is [config/ai.example.toml](config/ai.example.toml).
 
-No secrets belong in `ai.toml`. Use Keychain through `cmux-inline-ai-key`, or
+No secrets belong in `ai.toml`. Use Keychain through `termtab-ai-key`, or
 environment variables:
 
 - `OPENROUTER_API_KEY`
@@ -93,6 +97,9 @@ The helper redacts common credential shapes before prompt construction:
 The repository intentionally includes only source, docs, tests, and example
 config. It does not include local Keychain contents, API keys, shell history,
 or runtime caches.
+
+Existing installs that used the older `cmux-inline-ai-*` Keychain service names
+continue to work as a migration fallback, but new installs use `termtab-ai-*`.
 
 ## Uninstall
 
