@@ -5,8 +5,8 @@
 termTab is a terminal-agnostic zsh autocomplete plugin. It provides Warp-style
 ghost text without requiring control of the terminal renderer. The renderer is
 `zsh-autosuggestions`; the intelligence is a local Python helper that first
-uses weighted shell history and then, only when needed, calls a configured BYOK
-model provider.
+uses current-session command events, weighted shell history, and then, only
+when needed, calls a configured BYOK model provider.
 
 The design goal is practical compatibility: it should work in Apple Terminal,
 iTerm2, Ghostty, VS Code terminals, and any other terminal that can run zsh and
@@ -24,9 +24,10 @@ zsh-autosuggestions strategy
   |
   v
 termTab Python helper
-  owns: history scoring, secret redaction, help capture, prompt building
+  owns: next-step inference, history scoring, secret redaction, help capture,
+        prompt building
   |
-  +--> local history and command --help cache
+  +--> session log, local history, and command --help cache
   |
   +--> provider adapter
        OpenRouter, Anthropic, OpenAI-compatible, or Ollama
@@ -40,20 +41,24 @@ single terminal.
 ## Completion Flow
 
 1. zsh asks `zsh-autosuggestions` for a suggestion.
-2. The termTab strategy flushes recent shell history with `fc -AI`.
+2. The termTab strategy records completed commands in a per-terminal session
+   log and flushes recent zsh history with `fc -AI`.
 3. The helper receives the current line and cwd.
 4. Secret-looking input is rejected before any prompt is built.
-5. History is searched for prefix matches.
-6. Matches are scored by recency, frequency, and concise suffix length.
-7. A strong prefix match is returned immediately, without network access.
-8. If history does not answer, the helper builds a scrubbed prompt.
-9. The configured provider returns a suffix.
-10. The helper normalizes the suffix into a full-line suggestion.
-11. `zsh-autosuggestions` renders the result as gray ghost text.
+5. Recent session commands are checked for deterministic next-step patterns.
+6. History is searched for prefix matches.
+7. Matches are scored by recency, frequency, and concise suffix length.
+8. A strong local match is returned immediately, without network access.
+9. If local context does not answer, the helper builds a scrubbed prompt.
+10. The configured provider returns a suffix.
+11. The helper normalizes the suffix into a full-line suggestion.
+12. `zsh-autosuggestions` renders the result as gray ghost text.
 
 For repeated commands, the hot path is local and should be fast enough to feel
-native. Provider calls are a fallback for new commands, unfamiliar flags, and
-CLIs whose `--help` output adds useful context.
+native. Deterministic next-step suggestions are also local: if the session just
+ran `mkdir app`, typing `c` can suggest `cd app` without a model request.
+Provider calls are a fallback for new commands, unfamiliar flags, and CLIs
+whose `--help` output adds useful context.
 
 ## Public Configuration
 
@@ -73,6 +78,8 @@ debounce_ms = 120
 
 [history]
 enabled = true
+session_enabled = true
+session_max_entries = 200
 direct_match_min_chars = 3
 max_entries = 8000
 max_bytes = 2097152

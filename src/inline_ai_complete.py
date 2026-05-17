@@ -49,6 +49,8 @@ def load_config():
         "inline": {"enabled": True, "debounce_ms": 120},
         "history": {
             "enabled": True,
+            "session_enabled": True,
+            "session_max_entries": 200,
             "direct_match_min_chars": 3,
             "max_entries": 8000,
             "max_bytes": 2097152,
@@ -127,10 +129,50 @@ def history_path():
     return pathlib.Path(os.environ.get("HISTFILE", pathlib.Path.home() / ".zsh_history"))
 
 
+def session_log_path():
+    raw = os.environ.get("TERMTAB_SESSION_LOG")
+    return pathlib.Path(raw).expanduser() if raw else None
+
+
 def parse_history_command(raw):
     if raw.startswith(": ") and ";" in raw:
         raw = raw.split(";", 1)[1]
     return raw.strip()
+
+
+def parse_session_line(raw):
+    parts = raw.rstrip("\n").split("\t", 3)
+    if len(parts) != 4:
+        return None
+    timestamp, status, cwd, command = parts
+    command = command.strip()
+    if not command or len(command) > 512 or contains_secret(command):
+        return None
+    try:
+        status_int = int(status)
+    except ValueError:
+        status_int = 0
+    return {"timestamp": timestamp, "status": status_int, "cwd": cwd, "command": redact(command)}
+
+
+def session_events(max_entries=200):
+    path = session_log_path()
+    if not path or not path.exists():
+        return []
+    try:
+        lines = path.read_text(errors="ignore").splitlines()[-int(max_entries) :]
+    except Exception:
+        return []
+    events = []
+    for line in lines:
+        event = parse_session_line(line)
+        if event:
+            events.append(event)
+    return events
+
+
+def session_commands(max_entries=200):
+    return [event["command"] for event in session_events(max_entries=max_entries)]
 
 
 def history_commands(max_entries=8000, max_bytes=2097152):
@@ -157,6 +199,15 @@ def history_commands(max_entries=8000, max_bytes=2097152):
     return commands[-int(max_entries) :]
 
 
+def combined_history_commands(history_cfg):
+    max_entries = int(history_cfg.get("max_entries", 8000) or 8000)
+    max_bytes = int(history_cfg.get("max_bytes", 2097152) or 2097152)
+    commands = history_commands(max_entries=max_entries, max_bytes=max_bytes)
+    if history_cfg.get("session_enabled", True):
+        commands.extend(session_commands(max_entries=int(history_cfg.get("session_max_entries", 200) or 200)))
+    return commands
+
+
 def head_command(line):
     try:
         parts = shlex.split(line, posix=True)
@@ -179,7 +230,7 @@ def ranked_history_matches(line, history_cfg, limit=None, prefix_only=True):
     max_chars = int(history_cfg.get("max_suggestion_chars", 320) or 320)
     recency_weight = float(history_cfg.get("recency_weight", 100) or 100)
     frequency_weight = float(history_cfg.get("frequency_weight", 8) or 8)
-    commands = history_commands(max_entries=max_entries, max_bytes=max_bytes)
+    commands = combined_history_commands({**history_cfg, "max_entries": max_entries, "max_bytes": max_bytes})
     if not commands:
         return []
 
@@ -228,13 +279,95 @@ def best_history_suggestion(line, history_cfg):
 
 def recent_history(limit=8, history_cfg=None):
     if history_cfg:
-        commands = history_commands(
-            max_entries=min(int(history_cfg.get("max_entries", 8000) or 8000), 200),
-            max_bytes=min(int(history_cfg.get("max_bytes", 2097152) or 2097152), 262144),
+        commands = combined_history_commands(
+            {
+                **history_cfg,
+                "max_entries": min(int(history_cfg.get("max_entries", 8000) or 8000), 200),
+                "max_bytes": min(int(history_cfg.get("max_bytes", 2097152) or 2097152), 262144),
+            }
         )
         return commands[-limit:]
     commands = history_commands(max_entries=200, max_bytes=262144)
     return commands[-limit:]
+
+
+def shell_quote(path):
+    return shlex.quote(path)
+
+
+def mkdir_paths(command):
+    if re.search(r"[;&|<>`$()]", command):
+        return []
+    try:
+        parts = shlex.split(command, posix=True)
+    except Exception:
+        return []
+    while parts and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", parts[0]):
+        parts.pop(0)
+    while parts and parts[0] in ("command", "builtin", "noglob"):
+        parts.pop(0)
+    if not parts or parts[0] != "mkdir":
+        return []
+
+    paths = []
+    option_mode = True
+    for arg in parts[1:]:
+        if option_mode and arg == "--":
+            option_mode = False
+            continue
+        if option_mode and arg.startswith("-"):
+            continue
+        if arg:
+            paths.append(arg)
+    return paths
+
+
+def cd_suggestion_for_mkdir(command, event_cwd, current_cwd):
+    paths = mkdir_paths(command)
+    if not paths:
+        return ""
+    for created in reversed(paths):
+        if contains_secret(created):
+            continue
+        created_path = pathlib.Path(created).expanduser()
+        if not created_path.is_absolute():
+            base = pathlib.Path(event_cwd or current_cwd).expanduser()
+            created_path = base / created_path
+        try:
+            resolved = created_path.resolve()
+        except Exception:
+            resolved = created_path
+        if not resolved.is_dir():
+            continue
+        current = pathlib.Path(current_cwd).expanduser()
+        try:
+            same_cwd = current.resolve() == pathlib.Path(event_cwd or current_cwd).expanduser().resolve()
+        except Exception:
+            same_cwd = str(current) == str(event_cwd or current_cwd)
+        target = created if same_cwd and not pathlib.Path(created).expanduser().is_absolute() else str(resolved)
+        return f"cd {shell_quote(target)}"
+    return ""
+
+
+def inferred_next_command(line, cwd, history_cfg):
+    if not history_cfg.get("enabled", True):
+        return ""
+    candidates = []
+    if history_cfg.get("session_enabled", True):
+        candidates.extend(reversed(session_events(max_entries=int(history_cfg.get("session_max_entries", 200) or 200))))
+    for command in reversed(history_commands(max_entries=25, max_bytes=65536)):
+        candidates.append({"status": 0, "cwd": cwd, "command": command})
+
+    for event in candidates:
+        if event.get("status", 0) != 0:
+            return ""
+        suggestion = cd_suggestion_for_mkdir(event.get("command", ""), event.get("cwd") or cwd, cwd)
+        if not suggestion:
+            return ""
+        if suggestion.startswith(line) and suggestion != line and not contains_secret(suggestion):
+            return suggestion
+        return ""
+    return ""
 
 
 def help_cache_key(command, resolved):
@@ -415,7 +548,7 @@ def main():
     args = parser.parse_args()
 
     line = args.line
-    if len(line.strip()) < 2 or len(line) > 240 or contains_secret(line):
+    if len(line) > 240 or contains_secret(line):
         return 0
 
     config = load_config()
@@ -423,6 +556,14 @@ def main():
         return 0
 
     history_cfg = config.get("history", {})
+    next_command = inferred_next_command(line, args.cwd, history_cfg)
+    if next_command:
+        sys.stdout.write(next_command)
+        return 0
+
+    if len(line.strip()) < 2:
+        return 0
+
     history_suggestion = best_history_suggestion(line, history_cfg)
     if history_suggestion:
         sys.stdout.write(history_suggestion)

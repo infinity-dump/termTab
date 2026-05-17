@@ -5,6 +5,8 @@ debounce_ms = 120
 
 [history]
 enabled = true
+session_enabled = true
+session_max_entries = 200
 direct_match_min_chars = 3
 max_entries = 8000
 max_bytes = 2097152

@@ -6,6 +6,10 @@ Terminal-agnostic inline AI autocomplete for zsh, rendered through
 The plugin is designed for command-line completions:
 
 - Local zsh history is searched first and weighted by recency plus frequency.
+- Commands from the current terminal session are tracked separately and ranked
+  above older global history.
+- Recent command intent is used for local next-step suggestions, such as
+  `mkdir app` followed by `c` completing to `cd app`.
 - Repeated commands complete locally without a network call.
 - Unseen commands fall through to an LLM provider.
 - OpenRouter is the default provider, using `mistralai/codestral-2508`.
@@ -76,13 +80,22 @@ gray ghost text.
 The Python helper:
 
 1. Rejects likely secret-bearing input.
-2. Searches shell history for prefix matches.
-3. Scores matches by recency, frequency, and concise suffix length.
-4. Returns a strong history match immediately.
-5. Otherwise builds a scrubbed prompt with recent history and cached
+2. Checks current-session command events for deterministic follow-ups.
+3. Searches shell history for prefix matches.
+4. Scores matches by recency, frequency, and concise suffix length.
+5. Returns a strong local match immediately.
+6. Otherwise builds a scrubbed prompt with recent history and cached
    `<command> --help` text.
-6. Calls the configured provider and normalizes the response to a full-line
+7. Calls the configured provider and normalizes the response to a full-line
    suggestion.
+
+Example local follow-up:
+
+```zsh
+mkdir app
+# type: c
+# suggestion: cd app
+```
 
 ## Secret Handling
 
