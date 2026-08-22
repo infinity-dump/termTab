@@ -16,6 +16,7 @@ if [[ ! -r "$autosuggestions_dir/zsh-autosuggestions.zsh" ]]; then
 fi
 
 install -m 0755 "$repo_dir/src/inline_ai_complete.py" "$inline_dir/inline_ai_complete.py"
+install -m 0755 "$repo_dir/src/pty_record.py" "$inline_dir/pty_record.py"
 install -m 0644 "$repo_dir/src/inline-ai.zsh" "$inline_dir/inline-ai.zsh"
 install -m 0755 "$repo_dir/src/termtab-ai-key" "$bin_dir/termtab-ai-key"
 

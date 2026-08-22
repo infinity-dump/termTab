@@ -78,8 +78,12 @@ autocomplete request it flushes recent zsh history, invokes
 gray ghost text.
 
 When `output_capture.enabled = true` (the default), the plugin also re-execs
-the interactive zsh under `script(1)` so the session typescript is recorded
-to `~/.cache/termtab/inline-ai/sessions/<id>.tty`. After each command, the
+the interactive zsh under `src/pty_record.py`, a small `script(1)`-style
+recorder, so the session typescript is recorded to
+`~/.cache/termtab/inline-ai/sessions/<id>.tty`. Unlike BSD `script(1)`, the
+recorder forwards window resizes (SIGWINCH) to the inner pty, so fullscreen
+TUIs keep rendering correctly after the terminal is resized. After each
+command, the
 plugin records the byte range covering that command's output, plus exit
 status and cwd, into `<id>.last.tsv`. The Python helper reads that sidecar
 on the next keystroke, strips ANSI, and uses the last command's output as

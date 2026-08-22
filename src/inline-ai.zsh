@@ -37,7 +37,8 @@ _termtab_ai_capture_enabled() {
   [[ "${TERMTAB_SCRIPT_ACTIVE:-0}" == 1 ]] && return 1
   [[ "${TERMTAB_INLINE_AI_NO_CAPTURE:-0}" == 1 ]] && return 1
   [[ -t 0 && -t 1 ]] || return 1
-  command -v script >/dev/null 2>&1 || return 1
+  [[ -r "$HOME/.config/termtab/inline-ai/pty_record.py" ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
   local toml="$HOME/.config/termtab/ai.toml"
   [[ -r "$toml" ]] || return 0
   awk '
@@ -55,7 +56,9 @@ if _termtab_ai_capture_enabled; then
   ( umask 077; : > "$TERMTAB_TYPESCRIPT" ) 2>/dev/null || true
   rm -f "$TERMTAB_OUTPUT_LAST" "${TERMTAB_SESSION_LOG:r}.last.tsv" 2>/dev/null || true
   find "${TERMTAB_SESSION_LOG:h}" -maxdepth 1 -type f \( -name '*.tty' -o -name '*.last.tsv' -o -name '*.out.tsv' \) -mtime +7 -delete 2>/dev/null
-  exec script -q -F -t 0 "$TERMTAB_TYPESCRIPT" zsh -i
+  # pty_record.py instead of script(1): BSD script sizes its inner pty once
+  # and never forwards window resizes, which mangled fullscreen TUIs.
+  exec python3 "$HOME/.config/termtab/inline-ai/pty_record.py" "$TERMTAB_TYPESCRIPT" -- zsh -i
 fi
 
 # Sidecars hold command lines and output ranges; create 0600 before first append.

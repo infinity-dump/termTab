@@ -4,7 +4,8 @@ accept_keys = ["right"]
 debounce_ms = 120
 
 [output_capture]
-# When true, the plugin re-execs the interactive shell under script(1) so the
+# When true, the plugin re-execs the interactive shell under a script(1)-style
+# pty recorder (pty_record.py, which also forwards window resizes) so the
 # session typescript can be parsed for the last command's stdout/stderr. The
 # helper uses that context to suggest corrections when the user mistypes a
 # command and starts retyping. Set to false to keep the shell vanilla.
