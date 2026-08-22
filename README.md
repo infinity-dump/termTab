@@ -77,6 +77,25 @@ autocomplete request it flushes recent zsh history, invokes
 `src/inline_ai_complete.py`, and renders the returned full-line suggestion as
 gray ghost text.
 
+When `output_capture.enabled = true` (the default), the plugin also re-execs
+the interactive zsh under `script(1)` so the session typescript is recorded
+to `~/.cache/termtab/inline-ai/sessions/<id>.tty`. After each command, the
+plugin records the byte range covering that command's output, plus exit
+status and cwd, into `<id>.last.tsv`. The Python helper reads that sidecar
+on the next keystroke, strips ANSI, and uses the last command's output as
+context — for example, when `gti status` fails with `zsh: command not found:
+gti`, typing `g` ghost-suggests `git status` instead of replaying the typo.
+Set `output_capture.enabled = false` in `ai.toml` to keep the shell vanilla.
+
+When a correction diverges from what is already typed, zsh-autosuggestions
+cannot render it as normal ghost text. termTab then shows a ZLE status message
+like `termTab fix: Alt-R replaces with: ...`; press Alt-R/Esc-r, or
+Ctrl-X Ctrl-R, to replace the whole buffer with the correction.
+
+Tab remains normal zsh completion. If the shell can complete or list filesystem
+or command matches, Tab keeps doing that; use right-arrow/end to accept ghost
+text.
+
 The Python helper:
 
 1. Rejects likely secret-bearing input.

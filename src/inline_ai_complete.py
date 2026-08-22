@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import difflib
 import hashlib
 import json
 import os
 import pathlib
+import posixpath
 import re
 import shlex
 import shutil
@@ -39,9 +41,25 @@ SECRET_PATTERNS = [
     re.compile(r"\bsk-ant-[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"\bghp_[A-Za-z0-9_]{12,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]+"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    # DOTALL block: redact the whole key body, or to EOF when the END
+    # marker was truncated out of the captured output.
+    re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)",
+        re.DOTALL,
+    ),
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}"),
 ]
+
+ANSI_PATTERN = re.compile(
+    rb"\x1b(?:\[[?0-9;]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[PX^_].*?\x1b\\|[@-Z\\-_])",
+    re.DOTALL,
+)
+
+OUTPUT_MAX_BYTES = 32768
+OUTPUT_MAX_LINES = 150
+OUTPUT_TAIL_FOR_PROMPT = 4096
+OUTPUT_TAIL_FOR_CORRECTION = 8192
+PATH_BIN_CACHE_TTL = 300
 
 
 def load_config():
@@ -77,6 +95,15 @@ def load_config():
         except Exception:
             return config
     return config
+
+
+def _expanduser_safe(raw):
+    # ~unknownuser raises RuntimeError (not OSError); keep the literal path.
+    path = pathlib.Path(raw)
+    try:
+        return path.expanduser()
+    except (OSError, RuntimeError):
+        return path
 
 
 def redact(text):
@@ -155,6 +182,472 @@ def parse_session_line(raw):
     return {"timestamp": timestamp, "status": status_int, "cwd": cwd, "command": redact(command)}
 
 
+def sanitize_typescript(data):
+    if not data:
+        return ""
+    cleaned = ANSI_PATTERN.sub(b"", data)
+    cleaned = cleaned.replace(b"\r\n", b"\n").replace(b"\x00", b"")
+    text = cleaned.decode("utf-8", errors="replace")
+    out_lines = []
+    for line in text.split("\n"):
+        if "\r" in line:
+            line = line.rsplit("\r", 1)[-1]
+        if "\b" in line:
+            buf = []
+            for ch in line:
+                if ch == "\b":
+                    if buf:
+                        buf.pop()
+                else:
+                    buf.append(ch)
+            line = "".join(buf)
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
+def trim_output(text, max_lines=OUTPUT_MAX_LINES, max_bytes=OUTPUT_MAX_BYTES):
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    out = "\n".join(lines)
+    if len(out.encode("utf-8", errors="replace")) > max_bytes:
+        out = out.encode("utf-8", errors="replace")[-max_bytes:].decode("utf-8", errors="replace")
+    return out
+
+
+def last_event_path():
+    raw = os.environ.get("TERMTAB_OUTPUT_LAST")
+    return pathlib.Path(raw).expanduser() if raw else None
+
+
+def parse_last_event_line(raw):
+    parts = raw.rstrip("\n").split("\t", 6)
+    if len(parts) != 7:
+        return None
+    timestamp, status, cwd, command, tty_path, start, end = parts
+    if not command or contains_secret(command):
+        return None
+    try:
+        return {
+            "ts": int(timestamp or 0),
+            "exit": int(status or 0),
+            "cwd": cwd,
+            "cmd": redact(command),
+            "tty": tty_path,
+            "start": int(start or 0),
+            "end": int(end or 0),
+        }
+    except ValueError:
+        return None
+
+
+def read_typescript_slice(tty_path, start, end, max_bytes=OUTPUT_MAX_BYTES):
+    if not tty_path or start is None or end is None or end <= start:
+        return ""
+    try:
+        path = pathlib.Path(tty_path).expanduser()
+        size = path.stat().st_size
+    except (OSError, ValueError):
+        return ""
+    start = max(0, min(int(start), size))
+    end = max(start, min(int(end), size))
+    length = end - start
+    if length <= 0:
+        return ""
+    if length > max_bytes:
+        start = end - max_bytes
+        length = max_bytes
+    try:
+        with path.open("rb") as handle:
+            handle.seek(start)
+            raw = handle.read(length)
+    except OSError:
+        return ""
+    return sanitize_typescript(raw)
+
+
+def read_recent_terminal_events(max_records=50):
+    path = last_event_path()
+    if not path or not path.exists():
+        return []
+    try:
+        lines = path.read_text(errors="ignore").splitlines()[-int(max_records):]
+    except OSError:
+        return []
+    events = []
+    for line in lines:
+        event = parse_last_event_line(line)
+        if event:
+            events.append(event)
+    return events
+
+
+def _populate_output(event):
+    if event is None:
+        return None
+    raw_output = read_typescript_slice(event.get("tty"), event.get("start"), event.get("end"))
+    event["output"] = redact(trim_output(raw_output))
+    return event
+
+
+def last_terminal_event():
+    events = read_recent_terminal_events(max_records=1)
+    if not events:
+        return None
+    return _populate_output(events[-1])
+
+
+def find_retry_context(line, current_cwd, max_records=30):
+    if not line:
+        return None
+    target_cwd = (current_cwd or "").rstrip("/")
+    for event in reversed(read_recent_terminal_events(max_records=max_records)):
+        event_cwd = (event.get("cwd") or "").rstrip("/")
+        if target_cwd and event_cwd and event_cwd != target_cwd:
+            continue
+        if not is_retry_intent(line, event.get("cmd") or ""):
+            continue
+        event = _populate_output(event)
+        if event.get("exit", 0) == 0 and not output_looks_failed(event.get("output") or ""):
+            continue
+        return event
+    return None
+
+
+def cached_path_executables():
+    cache_path = CACHE_DIR / "path-bins.txt"
+    try:
+        mtime = cache_path.stat().st_mtime
+        if time.time() - mtime < PATH_BIN_CACHE_TTL:
+            return cache_path.read_text(errors="ignore").splitlines()
+    except OSError:
+        pass
+    bins = set()
+    for directory in (os.environ.get("PATH") or "").split(os.pathsep):
+        if not directory:
+            continue
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_file(follow_symlinks=True) and os.access(entry.path, os.X_OK):
+                            bins.add(entry.name)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    listing = sorted(bins)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text("\n".join(listing))
+    except OSError:
+        pass
+    return listing
+
+
+def damerau_levenshtein(a, b, max_d=2):
+    if a == b:
+        return 0
+    if abs(len(a) - len(b)) > max_d:
+        return max_d + 1
+    n, m = len(a), len(b)
+    if n == 0:
+        return m
+    if m == 0:
+        return n
+    prev_prev = [0] * (m + 1)
+    prev = list(range(m + 1))
+    cur = [0] * (m + 1)
+    for i in range(1, n + 1):
+        cur[0] = i
+        row_min = cur[0]
+        for j in range(1, m + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                cur[j] = min(cur[j], prev_prev[j - 2] + 1)
+            if cur[j] < row_min:
+                row_min = cur[j]
+        if row_min > max_d:
+            return max_d + 1
+        prev_prev = prev[:]
+        prev = cur[:]
+    return prev[m]
+
+
+def closest_command(name):
+    if not name or len(name) < 2:
+        return ""
+    candidates = cached_path_executables()
+    if not candidates:
+        return ""
+    max_distance = 1 if len(name) <= 3 else 2
+    best = ""
+    best_d = max_distance + 1
+    for candidate in candidates:
+        if abs(len(candidate) - len(name)) > max_distance:
+            continue
+        distance = damerau_levenshtein(name, candidate, max_d=max_distance)
+        if distance < best_d:
+            best_d = distance
+            best = candidate
+            if distance == 1:
+                break
+    return best
+
+
+COMMAND_NOT_FOUND_RE = re.compile(r"(?:command not found|not found):\s*(\S+)", re.IGNORECASE)
+GIT_NOT_A_COMMAND_RE = re.compile(r"git: '([^']+)' is not a git command")
+GIT_DID_YOU_MEAN_RE = re.compile(r"The most similar commands?\s+(?:is|are)\s*\n((?:\s+\S+\n?)+)", re.IGNORECASE)
+DID_YOU_MEAN_RE = re.compile(r"[Dd]id you mean\s*['\"]?(\S+?)['\"]?[\?\.]")
+NPM_DID_YOU_MEAN_RE = re.compile(r"Did you mean (?:this\??|one of these\??)?\n((?:\s+\S+.*\n?)+)", re.IGNORECASE)
+NO_SUCH_FILE_RE = re.compile(
+    r"(?:No such file or directory|cannot stat|cannot access|cannot find|does not exist)",
+    re.IGNORECASE,
+)
+PATH_LIKE_TOKEN_RE = re.compile(r"^[~./]")
+ILLEGAL_OPTION_RE = re.compile(
+    r"(?:illegal option|invalid option|unrecognized option|unknown option)\s*"
+    r"(?:--\s*)?['\"]?(-{0,2}[A-Za-z0-9][\w-]*)['\"]?",
+    re.IGNORECASE,
+)
+FAILURE_OUTPUT_RE = re.compile(
+    r"(?:No such file or directory|cannot stat|cannot access|cannot find|does not exist|"
+    r"command not found|not found:\s*\S+|is not a git command|Did you mean|"
+    r"illegal option|invalid option|unrecognized option|unknown option)",
+    re.IGNORECASE,
+)
+
+
+def output_looks_failed(output):
+    return bool(output and FAILURE_OUTPUT_RE.search(output))
+
+
+def _replace_first_word(cmd, old_word, new_word):
+    tokens = cmd.split()
+    if not tokens or not new_word or contains_secret(new_word):
+        return ""
+    if tokens[0] == old_word:
+        tokens[0] = new_word
+        return " ".join(tokens)
+    return ""
+
+
+def _replace_subcommand(cmd, old_sub, new_sub):
+    tokens = cmd.split()
+    if len(tokens) < 2 or not new_sub or contains_secret(new_sub):
+        return ""
+    for index in range(1, len(tokens)):
+        if tokens[index] == old_sub:
+            tokens[index] = new_sub
+            return " ".join(tokens)
+    return ""
+
+
+def _shellquote_command(parts):
+    out = []
+    for part in parts:
+        if part and re.fullmatch(r"[\w./@:+,=%~-]+", part):
+            out.append(part)
+        else:
+            out.append(shlex.quote(part))
+    return " ".join(out)
+
+
+def _looks_like_path_arg(arg):
+    if not arg:
+        return False
+    if arg.startswith("-"):
+        return False
+    if "*" in arg or "?" in arg or "$" in arg or "`" in arg:
+        return False
+    if "=" in arg and not PATH_LIKE_TOKEN_RE.match(arg):
+        return False
+    return True
+
+
+def detect_path_correction(failed_cmd, output, cwd):
+    if not failed_cmd or not output or not NO_SUCH_FILE_RE.search(output):
+        return ""
+    try:
+        parts = shlex.split(failed_cmd, posix=True)
+    except ValueError:
+        return ""
+    if len(parts) < 2:
+        return ""
+    base_dir = pathlib.Path(cwd or ".").expanduser()
+    head = parts[0]
+    # For mv/cp/ln, the LAST argument is the destination and may legitimately not exist.
+    skip_last = head in {"mv", "cp", "ln", "rsync", "install"}
+    fixed = list(parts)
+    upper = len(parts) - 1 if skip_last else len(parts)
+    for index in range(1, upper):
+        arg = parts[index]
+        if not _looks_like_path_arg(arg):
+            continue
+        candidate = _expanduser_safe(arg)
+        if not candidate.is_absolute():
+            candidate = base_dir / candidate
+        if candidate.exists():
+            continue
+        parent = candidate.parent
+        if not parent.exists() or not parent.is_dir():
+            continue
+        try:
+            names = [entry.name for entry in parent.iterdir() if not entry.name.startswith(".")]
+        except OSError:
+            continue
+        if not names:
+            continue
+        target_name = candidate.name
+        cutoff = 0.62 if len(target_name) >= 4 else 0.78
+        matches = difflib.get_close_matches(target_name, names, n=1, cutoff=cutoff)
+        if not matches:
+            continue
+        repaired_name = matches[0]
+        if repaired_name == target_name:
+            continue
+        dir_part, _basename = posixpath.split(arg)
+        new_arg = posixpath.join(dir_part, repaired_name) if dir_part else repaired_name
+        if contains_secret(new_arg):
+            continue
+        fixed[index] = new_arg
+        return _shellquote_command(fixed)
+    return ""
+
+
+def detect_illegal_option_correction(failed_cmd, output):
+    if not failed_cmd or not output:
+        return ""
+    match = ILLEGAL_OPTION_RE.search(output)
+    if not match:
+        return ""
+    raw_bad = match.group(1)
+    bad = raw_bad.lstrip("-")
+    if not bad or len(bad) > 32:
+        return ""
+    try:
+        parts = shlex.split(failed_cmd, posix=True)
+    except ValueError:
+        return ""
+    if not parts:
+        return ""
+    new_parts = [parts[0]]
+    removed = False
+    for token in parts[1:]:
+        if not removed and token.startswith("--"):
+            if token == "--" + bad or token.startswith("--" + bad + "="):
+                removed = True
+                continue
+        elif not removed and token.startswith("-") and len(token) > 1:
+            if len(bad) == 1 and bad in token[1:]:
+                stripped = "-" + token[1:].replace(bad, "", 1)
+                if stripped == "-":
+                    removed = True
+                    continue
+                token = stripped
+                removed = True
+            elif token == "-" + bad:
+                removed = True
+                continue
+        new_parts.append(token)
+    if not removed or len(new_parts) < 2:
+        return ""
+    fix = _shellquote_command(new_parts)
+    if contains_secret(fix):
+        return ""
+    return fix
+
+
+def detect_correction(failed_cmd, output, cwd=None):
+    if not failed_cmd or not output:
+        return ""
+    text = output
+
+    match = GIT_NOT_A_COMMAND_RE.search(text)
+    if match:
+        wrong_sub = match.group(1)
+        similar = GIT_DID_YOU_MEAN_RE.search(text)
+        if similar:
+            for candidate in re.findall(r"\s+(\S+)", similar.group(1)):
+                fix = _replace_subcommand(failed_cmd, wrong_sub, candidate)
+                if fix:
+                    return fix
+
+    cnf = COMMAND_NOT_FOUND_RE.search(text)
+    if cnf:
+        wrong = cnf.group(1)
+        suggestion = closest_command(wrong)
+        if suggestion and suggestion != wrong:
+            fix = _replace_first_word(failed_cmd, wrong, suggestion)
+            if fix:
+                return fix
+
+    dym = DID_YOU_MEAN_RE.search(text)
+    if dym:
+        candidate = dym.group(1)
+        tokens = failed_cmd.split()
+        if tokens:
+            for index, token in enumerate(tokens):
+                if token != candidate and difflib.SequenceMatcher(None, token, candidate).ratio() >= 0.6:
+                    tokens[index] = candidate
+                    fix = " ".join(tokens)
+                    if not contains_secret(fix):
+                        return fix
+
+    path_fix = detect_path_correction(failed_cmd, text, cwd)
+    if path_fix:
+        return path_fix
+
+    flag_fix = detect_illegal_option_correction(failed_cmd, text)
+    if flag_fix:
+        return flag_fix
+    return ""
+
+
+def is_retry_intent(line, failed_cmd):
+    line_norm = (line or "").strip()
+    if not line_norm or not failed_cmd:
+        return False
+    failed_first = failed_cmd.split()[0] if failed_cmd.split() else ""
+    line_first = line_norm.split()[0] if line_norm.split() else ""
+    if not failed_first or not line_first:
+        return False
+    if failed_cmd.startswith(line_norm):
+        return True
+    if line_first == failed_first and difflib.SequenceMatcher(None, line_norm, failed_cmd).ratio() >= 0.72:
+        return True
+    if line_first != failed_first:
+        if line_first and failed_first.startswith(line_first[:1]):
+            if damerau_levenshtein(line_first, failed_first[: len(line_first) + 1], max_d=2) <= 1:
+                return True
+        if damerau_levenshtein(line_first, failed_first, max_d=2) <= 2:
+            return True
+    return False
+
+
+def correction_suggestion(line, current_cwd, event, require_prefix=True):
+    if not event:
+        return ""
+    if not line or len(line.strip()) < 1:
+        return ""
+    failed_cmd = event.get("cmd") or ""
+    output = event.get("output") or ""
+    event_cwd = (event.get("cwd") or "").rstrip("/") or current_cwd
+    corrected = detect_correction(failed_cmd, output, cwd=event_cwd or current_cwd)
+    if not corrected:
+        return ""
+    if corrected == line:
+        return ""
+    if require_prefix and not corrected.startswith(line):
+        return ""
+    if contains_secret(corrected) or len(corrected) > 320:
+        return ""
+    return corrected
+
+
 def session_events(max_entries=200):
     path = session_log_path()
     if not path or not path.exists():
@@ -173,6 +666,21 @@ def session_events(max_entries=200):
 
 def session_commands(max_entries=200):
     return [event["command"] for event in session_events(max_entries=max_entries)]
+
+
+def recent_failed_commands(cwd, max_entries=200, lookback=20):
+    failed = set()
+    target = (cwd or "").rstrip("/")
+    for event in session_events(max_entries=max_entries)[-lookback:]:
+        if event.get("status", 0) == 0:
+            continue
+        event_cwd = (event.get("cwd") or "").rstrip("/")
+        if target and event_cwd and event_cwd != target:
+            continue
+        cmd = event.get("command")
+        if cmd:
+            failed.add(cmd)
+    return failed
 
 
 def history_commands(max_entries=8000, max_bytes=2097152):
@@ -265,15 +773,27 @@ def ranked_history_matches(line, history_cfg, limit=None, prefix_only=True):
     return ranked[:limit]
 
 
-def best_history_suggestion(line, history_cfg):
-    if len(line.strip()) < int(history_cfg.get("direct_match_min_chars", 3) or 3):
+def best_history_suggestion(line, history_cfg, exclude=None, cwd=None):
+    min_chars = int(history_cfg.get("direct_match_min_chars", 3) or 3)
+    exclusions = set()
+    if isinstance(exclude, str):
+        if exclude:
+            exclusions.add(exclude)
+    elif exclude:
+        exclusions.update(item for item in exclude if item)
+    if exclusions:
+        min_chars = min(min_chars, 2)
+    if len(line.strip()) < min_chars:
         return ""
-    matches = ranked_history_matches(line, history_cfg, limit=1, prefix_only=True)
-    if not matches:
-        return ""
-    command = matches[0]["command"]
-    if command.startswith(line) and command != line and not contains_secret(command):
-        return command
+    matches = ranked_history_matches(line, history_cfg, limit=8, prefix_only=True)
+    for match in matches:
+        command = match["command"]
+        if command in exclusions:
+            continue
+        if not suggestion_valid_for_cwd(command, cwd):
+            continue
+        if command.startswith(line) and command != line and not contains_secret(command):
+            return command
     return ""
 
 
@@ -295,7 +815,72 @@ def shell_quote(path):
     return shlex.quote(path)
 
 
-def mkdir_paths(command):
+def cd_path_suggestion(line, cwd):
+    if not line or contains_secret(line):
+        return ""
+    match = re.match(r"^(cd|pushd)\s+([^;&|<>`$()]*)$", line)
+    if not match:
+        return ""
+
+    command = match.group(1)
+    raw_arg = match.group(2)
+    if not raw_arg or raw_arg.startswith("-") or raw_arg.endswith(" "):
+        return ""
+    if any(ch in raw_arg for ch in "\"'\\"):
+        return ""
+
+    dir_part, name_prefix = posixpath.split(raw_arg)
+    parent_arg = dir_part or "."
+    try:
+        parent = _resolve_candidate_path(parent_arg, cwd)
+    except OSError:
+        return ""
+    if not parent.is_dir():
+        return ""
+
+    try:
+        names = []
+        for entry in parent.iterdir():
+            if not entry.name.startswith(name_prefix):
+                continue
+            if not name_prefix.startswith(".") and entry.name.startswith("."):
+                continue
+            try:
+                if entry.is_dir():
+                    names.append(entry.name)
+            except OSError:
+                continue
+    except OSError:
+        return ""
+
+    if len(names) != 1:
+        return ""
+    suffix = _escape_completion_suffix(names[0][len(name_prefix):])
+    if suffix is None:
+        return ""
+    # Extend the typed line verbatim: zsh-autosuggestions only renders
+    # suggestions that prefix-match the buffer, so quoting the whole path
+    # ("cd 'demo app'", "cd '~/Projects'") silently drops the ghost text.
+    suggestion = line + suffix
+    if suggestion == line or contains_secret(suggestion):
+        return ""
+    return suggestion
+
+
+def _escape_completion_suffix(text):
+    if "\n" in text or "\r" in text:
+        return None
+    return re.sub(r"([^A-Za-z0-9_./+,^@%=:-])", r"\\\1", text)
+
+
+def _resolve_candidate_path(arg, cwd):
+    candidate = _expanduser_safe(arg)
+    if not candidate.is_absolute():
+        candidate = pathlib.Path(cwd or ".").expanduser() / candidate
+    return candidate
+
+
+def simple_command_parts(command):
     if re.search(r"[;&|<>`$()]", command):
         return []
     try:
@@ -306,6 +891,60 @@ def mkdir_paths(command):
         parts.pop(0)
     while parts and parts[0] in ("command", "builtin", "noglob"):
         parts.pop(0)
+    return parts
+
+
+def suggestion_valid_for_cwd(command, cwd=None):
+    if not cwd:
+        return True
+    if not command or contains_secret(command):
+        return False
+    parts = simple_command_parts(command)
+    if not parts:
+        return True
+
+    head = parts[0]
+    if head in {"cd", "pushd"}:
+        if len(parts) == 1:
+            return True
+        if len(parts) > 2:
+            return False
+        arg = parts[1]
+        if not _looks_like_path_arg(arg):
+            return True
+        try:
+            return _resolve_candidate_path(arg, cwd).is_dir()
+        except OSError:
+            return False
+
+    if head not in {"mv", "cp", "ln", "install"}:
+        return True
+
+    args = []
+    option_mode = True
+    for arg in parts[1:]:
+        if option_mode and arg == "--":
+            option_mode = False
+            continue
+        if option_mode and arg.startswith("-"):
+            continue
+        args.append(arg)
+    if len(args) < 2:
+        return True
+
+    for arg in args[:-1]:
+        if not _looks_like_path_arg(arg):
+            continue
+        try:
+            if not _resolve_candidate_path(arg, cwd).exists():
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def mkdir_paths(command):
+    parts = simple_command_parts(command)
     if not parts or parts[0] != "mkdir":
         return []
 
@@ -329,7 +968,7 @@ def cd_suggestion_for_mkdir(command, event_cwd, current_cwd):
     for created in reversed(paths):
         if contains_secret(created):
             continue
-        created_path = pathlib.Path(created).expanduser()
+        created_path = _expanduser_safe(created)
         if not created_path.is_absolute():
             base = pathlib.Path(event_cwd or current_cwd).expanduser()
             created_path = base / created_path
@@ -344,24 +983,107 @@ def cd_suggestion_for_mkdir(command, event_cwd, current_cwd):
             same_cwd = current.resolve() == pathlib.Path(event_cwd or current_cwd).expanduser().resolve()
         except Exception:
             same_cwd = str(current) == str(event_cwd or current_cwd)
-        target = created if same_cwd and not pathlib.Path(created).expanduser().is_absolute() else str(resolved)
+        target = created if same_cwd and not _expanduser_safe(created).is_absolute() else str(resolved)
         return f"cd {shell_quote(target)}"
     return ""
+
+
+def mv_target_path(command, event_cwd, current_cwd):
+    parts = simple_command_parts(command)
+    if not parts or parts[0] != "mv":
+        return ""
+
+    args = []
+    option_mode = True
+    for arg in parts[1:]:
+        if option_mode and arg == "--":
+            option_mode = False
+            continue
+        if option_mode and arg.startswith("-"):
+            continue
+        args.append(arg)
+    if len(args) < 2:
+        return ""
+
+    dest_arg = args[-1]
+    src_args = args[:-1]
+    if contains_secret(dest_arg) or any(contains_secret(src) for src in src_args):
+        return ""
+
+    base = pathlib.Path(event_cwd or current_cwd).expanduser()
+    dest_path = _expanduser_safe(dest_arg)
+    if not dest_path.is_absolute():
+        dest_path = base / dest_path
+
+    target_path = dest_path
+    target_arg = dest_arg
+    if len(src_args) == 1:
+        moved_name = pathlib.Path(src_args[0]).name
+        nested = dest_path / moved_name
+        if nested.is_dir():
+            target_path = nested
+            target_arg = posixpath.join(dest_arg, moved_name)
+
+    if not target_path.is_dir():
+        return ""
+
+    current = pathlib.Path(current_cwd).expanduser()
+    try:
+        same_cwd = current.resolve() == base.resolve()
+    except Exception:
+        same_cwd = str(current) == str(base)
+    if same_cwd and not pathlib.Path(dest_arg).expanduser().is_absolute():
+        return target_arg
+    try:
+        return str(target_path.resolve())
+    except Exception:
+        return str(target_path)
+
+
+def cd_suggestion_for_moved_dir(command, event_cwd, current_cwd):
+    target = mv_target_path(command, event_cwd, current_cwd)
+    if not target:
+        return ""
+    return f"cd {shell_quote(target)}"
+
+
+def event_success_status(event):
+    try:
+        return int(event.get("status", event.get("exit", 0)) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def event_succeeded(event):
+    if event_success_status(event) != 0:
+        return False
+    if event.get("tty"):
+        populated = _populate_output(dict(event))
+        if output_looks_failed(populated.get("output") or ""):
+            return False
+    return True
+
+
+def followup_suggestion_for_event(event, cwd):
+    command = event.get("command") or event.get("cmd") or ""
+    event_cwd = event.get("cwd") or cwd
+    return cd_suggestion_for_mkdir(command, event_cwd, cwd) or cd_suggestion_for_moved_dir(command, event_cwd, cwd)
 
 
 def inferred_next_command(line, cwd, history_cfg):
     if not history_cfg.get("enabled", True):
         return ""
     candidates = []
+    candidates.extend(reversed(read_recent_terminal_events(max_records=10)))
     if history_cfg.get("session_enabled", True):
         candidates.extend(reversed(session_events(max_entries=int(history_cfg.get("session_max_entries", 200) or 200))))
     for command in reversed(history_commands(max_entries=25, max_bytes=65536)):
         candidates.append({"status": 0, "cwd": cwd, "command": command})
 
     for event in candidates:
-        if event.get("status", 0) != 0:
+        if not event_succeeded(event):
             return ""
-        suggestion = cd_suggestion_for_mkdir(event.get("command", ""), event.get("cwd") or cwd, cwd)
+        suggestion = followup_suggestion_for_event(event, cwd)
         if not suggestion:
             return ""
         if suggestion.startswith(line) and suggestion != line and not contains_secret(suggestion):
@@ -411,29 +1133,60 @@ def cached_help(command):
     return text
 
 
-def build_prompt(line, cwd, history_cfg=None):
+def build_prompt(line, cwd, history_cfg=None, last_event=None, failed_commands=None):
     command = head_command(line) or ""
     history_cfg = history_cfg or {}
     history = "\n".join(f"- {item}" for item in recent_history(history_cfg=history_cfg))
     weighted_history = ranked_history_matches(line, history_cfg, prefix_only=True)
     if not weighted_history:
         weighted_history = ranked_history_matches(line, history_cfg, prefix_only=False)
+    weighted_history = [item for item in weighted_history if suggestion_valid_for_cwd(item.get("command", ""), cwd)]
     weighted_history_text = "\n".join(
         f"- score={item['score']:.1f} count={item['count']}: {item['command']}" for item in weighted_history
     )
     help_text = cached_help(command) if command else ""
+
+    failed_block = "(none)"
+    if failed_commands:
+        failed_block = "\n".join(f"- {cmd}" for cmd in list(failed_commands)[:10])
+
+    last_command_block = "(none)"
+    if last_event:
+        tail = last_event.get("output") or ""
+        if tail:
+            tail_lines = tail.splitlines()
+            if len(tail_lines) > 40:
+                tail_lines = tail_lines[-40:]
+            tail = "\n".join(tail_lines)
+            if len(tail) > OUTPUT_TAIL_FOR_PROMPT:
+                tail = tail[-OUTPUT_TAIL_FOR_PROMPT:]
+        last_command_block = (
+            f"cmd: {last_event.get('cmd','')}\n"
+            f"exit: {last_event.get('exit', 0)}\n"
+            f"cwd: {last_event.get('cwd','')}\n"
+            f"output_tail:\n{tail or '(empty)'}"
+        )
+
     system = (
         "You are terminal inline autocomplete. Complete the current terminal command line like "
         "Warp autocomplete. Return only the suffix that should be inserted at the cursor. "
         "Do not repeat the existing prefix. Do not include explanations, markdown, quotes, "
         "or trailing newline. Prefer highly weighted history matches, then exact flags/subcommands "
-        "from provided help. If no useful completion is likely, return an empty string."
+        "from provided help. When the previous command failed and the current line looks like the "
+        "user retrying it, return a completion that yields the corrected command instead of "
+        "extending the typo. If no useful completion is likely, return an empty string."
     )
     user = f"""cwd: {cwd}
 shell: zsh
 line_before_cursor: {redact(line)}
 line_after_cursor:
 head_command: {command}
+
+last_command:
+{last_command_block}
+
+recently_failed_commands_do_not_suggest:
+{failed_block}
 
 recent_terminal_history:
 {history}
@@ -450,6 +1203,8 @@ constraints:
 - Prefer a weighted history match when it is compatible with the current prefix.
 - Do not invent secrets, paths, hostnames, or destructive flags.
 - If the user is typing a flag prefix, complete the most likely flag.
+- If last_command failed and the user is retyping it, infer the intended command from output_tail and complete to that, not to the typo.
+- Never propose a completion that exactly matches anything in recently_failed_commands_do_not_suggest.
 """
     return system, user
 
@@ -536,15 +1291,32 @@ def merge_completion(line, raw):
     token_prefix = line[line.rfind(" ") + 1 :] if " " in line else line
     if token_prefix and text.startswith(token_prefix):
         text = text[len(token_prefix) :]
+    elif token_prefix and re.match(r"^(?:~|/|\./|\.\./)", text):
+        return ""
     if len(text) > 160:
         return ""
     return line + text
+
+
+def channel_text(value):
+    return (value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+def emit_result(value, kind="suggest", output_format="plain"):
+    if not value:
+        return
+    if output_format == "zsh":
+        sys.stdout.write(f"{kind}\t{channel_text(value)}")
+    else:
+        sys.stdout.write(value)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--line", required=True)
     parser.add_argument("--cwd", default=os.getcwd())
+    parser.add_argument("--mode", choices=("suggest", "replace"), default="suggest")
+    parser.add_argument("--format", choices=("plain", "zsh"), default="plain")
     args = parser.parse_args()
 
     line = args.line
@@ -556,17 +1328,53 @@ def main():
         return 0
 
     history_cfg = config.get("history", {})
+    retry_event = find_retry_context(line, args.cwd)
+
+    correction = correction_suggestion(line, args.cwd, retry_event, require_prefix=False)
+    if args.mode == "replace":
+        emit_result(correction, "replace", args.format)
+        return 0
+
+    if correction:
+        if correction.startswith(line):
+            emit_result(correction, "suggest", args.format)
+            return 0
+        if args.format == "zsh":
+            emit_result(correction, "replace", args.format)
+            return 0
+
+    failed_retry = retry_event is not None
+    exclude_history = set()
+    if failed_retry:
+        exclude_history.update(
+            recent_failed_commands(
+                args.cwd,
+                max_entries=int(history_cfg.get("session_max_entries", 200) or 200),
+            )
+        )
+        for event in read_recent_terminal_events(max_records=30):
+            if event.get("exit", 0) != 0 and event.get("cmd"):
+                exclude_history.add(event["cmd"])
+        retry_cmd = retry_event.get("cmd")
+        if retry_cmd:
+            exclude_history.add(retry_cmd)
+
+    path_suggestion = cd_path_suggestion(line, args.cwd)
+    if path_suggestion:
+        emit_result(path_suggestion, "suggest", args.format)
+        return 0
+
     next_command = inferred_next_command(line, args.cwd, history_cfg)
-    if next_command:
-        sys.stdout.write(next_command)
+    if next_command and next_command not in exclude_history:
+        emit_result(next_command, "suggest", args.format)
         return 0
 
-    if len(line.strip()) < 2:
+    if len(line.strip()) < 2 and not failed_retry:
         return 0
 
-    history_suggestion = best_history_suggestion(line, history_cfg)
+    history_suggestion = best_history_suggestion(line, history_cfg, exclude=exclude_history or None, cwd=args.cwd)
     if history_suggestion:
-        sys.stdout.write(history_suggestion)
+        emit_result(history_suggestion, "suggest", args.format)
         return 0
 
     provider_cfg = config.get("provider", {})
@@ -587,7 +1395,18 @@ def main():
     if debounce_ms > 0:
         time.sleep(min(debounce_ms, 1000) / 1000)
 
-    system, user = build_prompt(line, args.cwd, history_cfg=history_cfg)
+    prompt_event = retry_event
+    if not prompt_event:
+        last_event = last_terminal_event()
+        if last_event and last_event.get("exit", 0) != 0:
+            prompt_event = last_event
+    system, user = build_prompt(
+        line,
+        args.cwd,
+        history_cfg=history_cfg,
+        last_event=prompt_event,
+        failed_commands=exclude_history or None,
+    )
 
     try:
         if provider == "anthropic":
@@ -612,8 +1431,10 @@ def main():
         return 0
 
     suggestion = merge_completion(line, raw)
-    if suggestion and suggestion.startswith(line) and not contains_secret(suggestion):
-        sys.stdout.write(suggestion)
+    if suggestion and suggestion in exclude_history:
+        return 0
+    if suggestion and suggestion.startswith(line) and suggestion_valid_for_cwd(suggestion, args.cwd):
+        emit_result(suggestion, "suggest", args.format)
     return 0
 
 

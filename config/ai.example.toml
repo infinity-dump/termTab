@@ -1,7 +1,14 @@
 [inline]
 enabled = true
-accept_keys = ["right", "tab"]
+accept_keys = ["right"]
 debounce_ms = 120
+
+[output_capture]
+# When true, the plugin re-execs the interactive shell under script(1) so the
+# session typescript can be parsed for the last command's stdout/stderr. The
+# helper uses that context to suggest corrections when the user mistypes a
+# command and starts retyping. Set to false to keep the shell vanilla.
+enabled = true
 
 [history]
 enabled = true

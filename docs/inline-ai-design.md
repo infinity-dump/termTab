@@ -20,7 +20,7 @@ zsh line editor
   |
   v
 zsh-autosuggestions strategy
-  owns: ghost text rendering and Tab acceptance
+  owns: ghost text rendering
   |
   v
 termTab Python helper
@@ -54,6 +54,18 @@ single terminal.
 11. The helper normalizes the suffix into a full-line suggestion.
 12. `zsh-autosuggestions` renders the result as gray ghost text.
 
+If a failed-command correction no longer starts with the current buffer,
+termTab sends a replacement result through a private autosuggestions marker
+instead of trying to render bad ghost text. The parent ZLE process intercepts
+that marker, clears `POSTDISPLAY`, shows `termTab fix: Alt-R replaces with: ...`,
+and stores the corrected full command. Alt-R/Esc-r or Ctrl-X Ctrl-R replaces
+the current buffer with that stored correction and moves the cursor to the end.
+
+Tab remains owned by normal zsh completion. If filesystem or command completion
+has matches, pressing Tab completes or lists them according to the user's zsh
+setup, including repeated-Tab listing. termTab suggestions are accepted with
+right-arrow/end, not by stealing Tab.
+
 For repeated commands, the hot path is local and should be fast enough to feel
 native. Deterministic next-step suggestions are also local: if the session just
 ran `mkdir app`, typing `c` can suggest `cd app` without a model request.
@@ -73,7 +85,7 @@ Example:
 ```toml
 [inline]
 enabled = true
-accept_keys = ["right", "tab"]
+accept_keys = ["right"]
 debounce_ms = 120
 
 [history]
